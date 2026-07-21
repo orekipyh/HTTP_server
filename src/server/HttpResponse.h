@@ -4,6 +4,7 @@
 
 #include <string>
 #include <map>
+#include <ctime>
 
 class HttpResponse {
 public:
@@ -40,6 +41,21 @@ public:
     // 获取响应体
     const std::string& body() const { return body_; }
 
+    // 设置是否使用长连接（Keep-Alive）
+    // keep_alive: true 表示响应头中设置 Connection: keep-alive
+    void setKeepAlive(bool keep_alive);
+
+    // 设置 Last-Modified 响应头
+    // t: 文件的最后修改时间（time_t），会自动格式化为 HTTP 标准日期格式
+    void setLastModified(time_t t);
+
+    // 设置 Cache-Control 响应头
+    // cache_control: 缓存控制策略（如 "no-cache"、"public, max-age=3600" 等）
+    void setCacheControl(const std::string& cache_control);
+
+    // 获取是否使用长连接
+    bool keepAlive() const { return keep_alive_; }
+
     // 生成404 Not Found错误响应
     // 返回: 包含HTML错误页面的HttpResponse对象
     static HttpResponse notFound();
@@ -47,6 +63,10 @@ public:
     // 生成500 Internal Server Error错误响应
     // 返回: 包含HTML错误页面的HttpResponse对象
     static HttpResponse internalError();
+
+    // 生成405 Method Not Allowed错误响应
+    // 返回: 包含HTML错误页面的HttpResponse对象
+    static HttpResponse methodNotAllowed();
 
 private:
     // 根据扩展名获取MIME类型
@@ -57,6 +77,9 @@ private:
     int status_code_;                          // HTTP状态码
     std::string content_type_;                  // Content-Type
     std::string body_;                         // 响应体
+    bool keep_alive_;                          // 是否使用长连接（Keep-Alive）
+    std::string last_modified_;                // Last-Modified 响应头（HTTP 标准日期格式）
+    std::string cache_control_;                // Cache-Control 响应头
     std::map<int, std::string> status_text_;  // 状态码描述映射表
 };
 

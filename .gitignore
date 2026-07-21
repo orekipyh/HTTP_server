@@ -1,11 +1,19 @@
+# 编译目录
 build/
-.cache/
-*.o
-*.exe
-*.out
-CMakeCache.txt
+build2/
+# CMake缓存
 CMakeFiles/
+*.cmake
+CMakeCache.txt
 cmake_install.cmake
-compile_commands.json
-test_file_util.cpp test_http_request.cpp test_http_response.cpp
-CMakeLists.txt HTTP报错.txt 开发文档.txt 面试准备文档.txt
+# 二进制文件
+*.exe
+*.dll
+*.obj
+*.pdb
+# IDE配置
+.vscode/
+.cache/
+# 日志、数据库
+*.log
+*.db

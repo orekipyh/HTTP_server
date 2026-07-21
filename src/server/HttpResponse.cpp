@@ -1,12 +1,14 @@
 #include "HttpResponse.h"
 #include <sstream>
 #include <algorithm>
+#include <ctime>
 
-// 构造函数：初始化状态码和状态文本映射
-HttpResponse::HttpResponse() : status_code_(200) {
+// 构造函数：初始化状态码和状态文本映射，默认使用短连接
+HttpResponse::HttpResponse() : status_code_(200), keep_alive_(false) {
     // 初始化常见HTTP状态码及其描述
     status_text_[200] = "OK";
     status_text_[404] = "Not Found";
+    status_text_[405] = "Method Not Allowed";
     status_text_[500] = "Internal Server Error";
     status_text_[400] = "Bad Request";
     status_text_[403] = "Forbidden";
@@ -27,6 +29,27 @@ void HttpResponse::setContentType(const std::string& content_type) {
 // 设置响应体内容
 void HttpResponse::setBody(const std::string& body) {
     body_ = body;
+}
+
+// 设置是否使用长连接（Keep-Alive）
+void HttpResponse::setKeepAlive(bool keep_alive) {
+    keep_alive_ = keep_alive;
+}
+
+// 设置 Last-Modified 响应头
+// 将 time_t 格式化为 HTTP 标准日期格式：如 "Thu, 01 Dec 2024 16:00:00 GMT"
+void HttpResponse::setLastModified(time_t t) {
+    //将 time_t 转换为 struct tm 结构体
+    struct tm* gmt = gmtime(&t);
+    char buf[128];
+    //将 struct tm 按格式字符串 %a, %d %b %Y %H:%M:%S GMT 写入 buf ，最终得到形如 "Thu, 01 Dec 2024 16:00:00 GMT" 的字符串
+    strftime(buf, sizeof(buf), "%a, %d %b %Y %H:%M:%S GMT", gmt);
+    last_modified_ = buf;
+}
+
+// 设置 Cache-Control 响应头
+void HttpResponse::setCacheControl(const std::string& cache_control) {
+    cache_control_ = cache_control;
 }
 
 // 根据文件路径自动设置Content-Type
@@ -72,10 +95,24 @@ std::string HttpResponse::toString() const {
     // 生成Content-Length头（响应体大小）
     oss << "Content-Length: " << body_.size() << "\r\n";
 
-    // 生成Connection头（使用close关闭连接，简单处理）
-    // 告诉客户端响应完成后关闭连接，下次再请求时需要重新建立TCP连接
-    // 简单场景使用
-    oss << "Connection: close\r\n";
+    // 生成Connection头
+    // 如果客户端请求长连接（keep-alive），则响应头中设置 Connection: keep-alive
+    // 否则设置 Connection: close，通知客户端响应完成后关闭连接
+    if (keep_alive_) {
+        oss << "Connection: keep-alive\r\n";
+    } else {
+        oss << "Connection: close\r\n";
+    }
+
+    // 生成Cache-Control头（如果已设置）
+    if (!cache_control_.empty()) {
+        oss << "Cache-Control: " << cache_control_ << "\r\n";
+    }
+
+    // 生成Last-Modified头（如果已设置）
+    if (!last_modified_.empty()) {
+        oss << "Last-Modified: " << last_modified_ << "\r\n";
+    }
 
     // 空行分隔 header 和 body
     oss << "\r\n";
@@ -174,6 +211,28 @@ HttpResponse HttpResponse::notFound() {
          << "<body>\n"
          << "<h1>404 Not Found</h1>\n"
          << "<p>The requested file was not found on this server.</p>\n"
+         << "</body>\n"
+         << "</html>\n";
+
+    response.setBody(body.str());
+    return response;
+}
+
+// 生成405 Method Not Allowed错误响应
+// 当请求方法不是GET时返回此响应，并附带 Allow: GET 响应头
+HttpResponse HttpResponse::methodNotAllowed() {
+    HttpResponse response;
+    response.setStatusCode(405);
+    response.setContentType("text/html");
+
+    // 生成简单的HTML错误页面
+    std::ostringstream body;
+    body << "<!DOCTYPE html>\n"
+         << "<html>\n"
+         << "<head><title>405 Method Not Allowed</title></head>\n"
+         << "<body>\n"
+         << "<h1>405 Method Not Allowed</h1>\n"
+         << "<p>The method is not allowed for this server.</p>\n"
          << "</body>\n"
          << "</html>\n";
 

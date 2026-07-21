@@ -1,4 +1,5 @@
 #include <cstddef>
+#include <vector>
 #include <sys/types.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -33,21 +34,20 @@ bool FileUtil::readFile() {
     }
 
     // 分配缓冲区存储文件内容
-    // 使用动态分配是因为文件大小在编译时未知
-    char* buffer = new char[file_size + 1];
+    // 使用 RAII 管理资源，避免手动 delete
+    std::vector<char> buffer(file_size + 1);
 
     // 以二进制模式打开文件
     // "rb": r=读取模式，b=二进制模式（避免Windows下\r\n转换问题）
     FILE* fp = fopen(file_path_.c_str(), "rb");
     if (fp == nullptr) {
         error_ = "Failed to open file: " + file_path_;
-        delete[] buffer;
         return false;
     }
 
     // 读取文件内容到缓冲区
     // fread返回成功读取的元素数量，不是字节数
-    size_t bytes_read = fread(buffer, 1, file_size, fp);
+    size_t bytes_read = fread(buffer.data(), 1, file_size, fp);
 
     // 确保缓冲区以null结尾（便于当作C字符串使用）
     // 加'\0'是为了拼成字符串
@@ -59,15 +59,11 @@ bool FileUtil::readFile() {
     // 检查实际读取的字节数是否与文件大小一致
     if (static_cast<int64_t>(bytes_read) != file_size) {
         error_ = "Failed to read complete file: " + file_path_;
-        delete[] buffer;
         return false;
     }
 
     // 将缓冲区内容转移到content_成员变量中
-    content_ = buffer;
-
-    // 释放动态分配的缓冲区
-    delete[] buffer;
+    content_ = buffer.data();
 
     return true;
 }

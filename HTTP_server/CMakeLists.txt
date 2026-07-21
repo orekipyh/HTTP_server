@@ -11,7 +11,6 @@ include_directories(
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/src/server
     ${CMAKE_SOURCE_DIR}/src/utils
-    ${CMAKE_SOURCE_DIR}/src/thread
 )
 
 add_library(Socket STATIC src/server/Socket.cpp)
@@ -26,11 +25,8 @@ add_library(HttpResponse STATIC src/server/HttpResponse.cpp)
 
 add_library(FileUtil STATIC src/utils/FileUtil.cpp)
 
-add_library(ThreadPool STATIC src/thread/ThreadPool.cpp)
-target_link_libraries(ThreadPool pthread)
-
-add_library(HttpServer STATIC src/server/HttpServer.cpp src/server/ServerLogger.cpp)
-target_link_libraries(HttpServer Socket Epoll HttpRequest HttpResponse FileUtil ThreadPool pthread)
+add_library(HttpServer STATIC src/server/HttpServer.cpp)
+target_link_libraries(HttpServer Socket Epoll HttpRequest HttpResponse FileUtil pthread)
 
 add_executable(http_server src/main.cpp)
 target_link_libraries(http_server HttpServer pthread)

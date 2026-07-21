@@ -1,0 +1,6 @@
+{
+    "port": 8888,
+    "root_dir": "./www",
+    "thread_count": 5,
+    "keep_alive_timeout": 3600
+}

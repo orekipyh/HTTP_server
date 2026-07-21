@@ -485,7 +485,7 @@
 
 #### 遇到的错误以及解决方案
 1. **端口被 Docker 进程占用**
-   - **问题**：启动服务器时 `./bin/http_server 8080 ../www/` 报错 `Failed to bind to port 8080: Address already in use`，经 `ss -tlnp | grep 8080` 排查发现端口被 docker-proxy（PID 1711/1721）占用
+   - **问题**：启动服务器时 `./bin/http_server 8888 ../www/` 报错 `Failed to bind to port 8888: Address already in use`，经 `ss -tlnp | grep 8888` 排查发现端口被 docker-proxy（PID 1711/1721）占用
    - **解决方案**：将端口改为 9090，避免与已有服务冲突
 
 2. **服务器 socket 使用边缘触发(ET)模式导致并发连接漏接**
@@ -547,12 +547,12 @@ make
 ### 4.2 运行命令
 ```bash
 # ./http_server <端口> <静态资源目录>
-./http_server 8080 ../www/
+./http_server 8888 ../www/
 ```
 
 ### 4.3 访问方式
-- 浏览器访问: `http://localhost:8080/index.html`
-- curl 访问: `curl http://localhost:8080/index.html`
+- 浏览器访问: `http://localhost:8888/index.html`
+- curl 访问: `curl http://localhost:8888/index.html`
 
 ---
 
@@ -561,7 +561,7 @@ make
 ### 5.1 请求格式
 ```
 GET /index.html HTTP/1.1\r\n
-Host: localhost:8080\r\n
+Host: localhost:8888\r\n
 Connection: keep-alive\r\n
 \r\n
 ```
@@ -593,3 +593,548 @@ Connection: close\r\n
 3. **资源释放**: 客户端断开连接后需及时关闭 socket，释放资源
 4. **异常处理**: 需要处理系统调用失败的情况（如 epoll_wait 返回 -1）
 5. **缓冲区大小**: 需要设置合理的接收缓冲区大小，防止内存溢出
+
+
+## 七、项目优化
+
+### 1. 新增功能：解析请求体
+
+**为何新增**：让服务器的功能更加完善，可以支持解析客户端的 POST 请求
+
+**涉及文件**：`HttpRequest.cpp`、`HttpRequest.h`
+
+**修改内容**：
+- 新增 `parseBody()` 私有方法，根据 `Content-Length` 请求头精确读取请求体
+- 重写 `parse()` 中的请求体解析逻辑，改用 `stream.read()` 按字节读取（而非 `getline` 逐行分割），避免二进制数据被换行符截断(比如把123\n456拆开读了，但是本来应该读一起)
+- `HttpRequest` 类中新增 `std::string body_` 成员变量，存储解析完成的请求体内容
+
+**测试流程**：
+1. 编译并启动服务器：`cd build && cmake .. && make && ./bin/http_server 8888 ../www/`
+2. 使用 curl 发送 POST 请求（含请求体）：
+   ```bash
+   curl -v -X POST -d "username=admin&password=123" http://localhost:8888/
+   ```
+3. 使用 curl 发送 JSON 格式的 POST 请求：
+   ```bash
+   curl -v -X POST -H "Content-Type: application/json" -d '{"username":"admin","password":"123"}' http://localhost:8888/
+   ```
+4. 使用 curl 发送不携带请求体的 GET 请求，验证没有报错：
+   ```bash
+   curl -v http://localhost:8888/index.html
+   ```
+
+**预期验收效果**：
+- POST 请求能被服务器正常接收，不因解析请求体而崩溃或返回错误 √
+- GET 请求不受影响，仍能正常返回静态文件 √
+- 服务器日志中可以看到 recv 接收到的 POST 请求数据量正确（与 Content-Length 一致）√
+
+---
+
+### 2. 新增功能：访问日志记录
+
+**为何新增**：方便追踪服务器的请求处理情况，便于调试和问题排查，体现服务端的"可观测性"
+
+**涉及文件**：新增 `ServerLogger.h`、`ServerLogger.cpp`；修改 `HttpServer.cpp`
+
+**修改内容**：
+- 新增 `ServerLogger` 类，采用**单例模式（Singleton）**设计，全局共享一个日志记录器
+- `ServerLogger` 提供公有的静态方法 `getInstance()` 获取唯一实例，构造函数为私有
+- 日志**同时输出到终端和 `server.log` 日志文件**，日志文件默认保存在**当前工作目录**（相对路径）
+- 提供 `log()` 方法记录访问日志，格式包含：时间戳、HTTP 方法、请求路径、响应状态码、响应体大小
+- 示例输出：`时间：[2026-06-17 14:30:25] 请求方式：GET 请求页面：/index.html 状态码：200 请求长度：1234bytes`
+- 构造函数接受日志文件路径参数，若不指定则默认为 `server.log`
+- 日志文件以**追加模式（`std::ios::app`）**打开，每次启动服务器不会覆盖已有日志
+- `HttpServer` 中通过 `ServerLogger::getInstance().log(...)` 记录每次请求的日志，无需传递或持有日志对象
+
+**涉及的单例模式要点**：
+| 要素 | 说明 |
+|------|------|
+| 私有构造函数 | 禁止外部直接创建 `ServerLogger` 实例 |
+| 静态私有实例 | 类内部持有唯一静态 `ServerLogger` 对象（如 `static ServerLogger instance_;`）|
+| 静态公有方法 | `static ServerLogger& getInstance()` 返回唯一实例的引用 |
+| 删除拷贝构造/赋值 | 使用 `= delete` 禁止拷贝，确保单例的唯一性 |
+| 线程安全 | 使用 `std::mutex` 保证多线程环境下 `log()` 方法和文件写入的线程安全性 |
+
+**类设计**：
+```cpp
+class ServerLogger {
+public:
+    static ServerLogger& getInstance();
+    void log(const std::string& method, const std::string& path,
+             int status_code, size_t response_size);
+    // 禁止拷贝和赋值
+    ServerLogger(const ServerLogger&) = delete;
+    ServerLogger& operator=(const ServerLogger&) = delete;
+
+private:
+    ServerLogger(const std::string& log_file = "server.log");  // 私有构造函数，默认日志文件名为 server.log
+    ~ServerLogger();
+    
+    std::ofstream log_file_;   // 日志文件输出流
+    std::mutex mutex_;          // 用于线程安全，保护文件写入
+};
+```
+
+**测试流程**：
+1. 编译并启动服务器：`cd build && cmake .. && make && ./bin/http_server 8888 ../www/`
+2. 在浏览器中访问 `http://localhost:8888/index.html`
+3. 在浏览器中访问 `http://localhost:8888/nonexistent.html`（触发 404）
+4. 使用 curl 访问不同路径，观察终端输出的日志：
+   ```bash
+   curl http://localhost:8888/index.html
+   curl http://localhost:8888/
+   curl http://localhost:8888/css/style.css
+   ```
+5. 检查 `server.log` 文件是否存在，并查看其内容是否与终端输出一致：
+   - 在 Linux 下：`cat build/server.log`
+   - 在 Windows 下：`type build\server.log`
+   - 按上述测试流程，工作目录是 `build/`，因此日志文件生成在 `build/server.log`
+6. 重启服务器，验证第二次启动的日志追加到 `server.log` 末尾，不会覆盖之前的记录：
+   ```bash
+   ./bin/http_server 8888 ../www/ &
+   # 访问几个页面产生新日志
+   curl http://localhost:8888/index.html
+   # 停止服务器
+   kill %1
+   # 查看日志文件，确认新旧日志内容都在
+   cat build/bin/server.log
+   ```
+7. 测试完成后清理：`rm build/bin/server.log`
+
+**预期验收效果**：
+- 每次请求都在服务器终端打印一行结构化日志√
+- 日志内容包含时间戳、HTTP 方法、请求路径、响应状态码、响应体大小√
+- 404 请求也能正确记录√
+- 同时生成 `server.log(在build文件夹里)` 文件，文件内容与终端输出一致√
+- 重启服务器后，新日志追加到 `server.log` 末尾，旧日志不被覆盖√
+- 整个服务器生命周期内只存在一个 `ServerLogger` 实例，日志记录集中管理√
+
+---
+
+### 3. 新增功能：超时断开机制
+
+**为何新增**：防止客户端建立连接后不发送数据，长期占用文件描述符和线程资源（资源泄漏）
+
+**涉及文件**：`HttpServer.h`、`HttpServer.cpp`
+
+**修改内容**：
+- `Connection` 结构体中新增 `time_t last_active` 字段，记录最近活跃时间
+- 每次收到客户端数据时更新 `last_active`
+- 主事件循环中定期检查所有连接，如果空闲时间超过阈值（如 1小时 ），主动关闭该连接
+
+**测试流程**：
+1. 编译并启动服务器：`cd build && cmake .. && make && ./bin/http_server 8888 ../www/`
+2. 使用 telnet 或 nc 建立一个连接但不发送数据：
+   ```bash
+   # 使用 nc（netcat，需安装）
+   nc -v localhost 8888
+   # 连接建立后什么都不输入，等待 30 秒以上
+   ```
+3. 观察服务器终端输出，看是否有"Connection closed"日志
+4. 验证超时断开后，该连接不再占用服务器资源：
+   ```bash
+   # 在另一个终端中查看服务器当前连接数
+   # 如果有 lsof 命令：
+   lsof -i :8888
+   ```
+
+**预期验收效果**：
+- 空闲连接在超时时间到达后自动关闭，服务器终端打印连接关闭日志√
+- 超时关闭后，该连接不再出现在端口监听列表中√
+- 正常请求的客户端不受影响，仍能正常获取响应√
+
+---
+
+### 4. 新增功能：支持 HTTP 长连接（Keep-Alive）
+
+**为何新增**：减少短连接频繁三次握手的开销，提升高并发场景下的性能
+
+**涉及文件**：`HttpServer.h`、`HttpServer.cpp`、`HttpResponse.cpp`
+
+**修改内容**：
+- 解析请求头中的 `Connection` 字段，判断客户端是否期望长连接
+- 如果客户端请求 `keep-alive`，响应头中不加 `Connection: close`，改为 `Connection: keep-alive`
+- `processRequest()` 处理完请求后不关闭连接，重新将 fd 注册到 epoll 等待下一个请求
+- 结合超时断开机制，防止空闲长连接一直不释放
+
+**测试流程**：
+1. 编译并启动服务器：`cd build && cmake .. && make && ./bin/http_server 8888 ../www/`
+2. 使用 curl 测试长连接（curl 默认使用 keep-alive）：
+   ```bash
+   # 使用 --next 在同一个连接中连续发送多个请求
+   curl -v http://localhost:8888/index.html --next http://localhost:8888/style.css
+   ```
+3. 使用 curl 显式请求短连接，验证服务器返回 `Connection: close`：
+   ```bash
+   curl -v -H "Connection: close" http://localhost:8888/index.html
+   ```
+4. 观察服务器终端输出的连接关闭日志，验证长连接下不会立即关闭：
+   ```bash
+   # 使用 while 循环在同一个连接中连续请求
+   curl -v http://localhost:8888/index.html http://localhost:8888/style.css http://localhost:8888/app.js
+   ```
+
+**预期验收效果**：
+- 使用 keep-alive 时，多个请求在同一个连接中完成，服务器不会在第一个请求后立刻关闭连接√
+- 使用 `Connection: close` 时，服务器行为与之前一致，响应后立即关闭连接√
+- 长连接在空闲超时后会被自动关闭（与超时断开机制配合）√
+
+---
+
+### 5. 新增功能：JSON 配置文件支持
+
+**为何新增**：将服务器配置参数（端口、资源目录、线程数等）从硬编码和命令行参数迁移到配置文件中，便于灵活调整
+
+**涉及文件**：新增 `config.json`、修改 `main.cpp`
+
+**修改内容**：
+- 在项目根目录新增 `config.json` 配置文件，支持以下字段：
+  ```json
+  {
+      "port": 8888,
+      "root_dir": "./www",
+      "thread_count": 8,
+      "keep_alive_timeout": 30
+  }
+  ```
+- `main.cpp` 中增加读取配置文件的功能：如果传入了配置文件路径则从文件读取；否则使用现有的命令行参数
+- 线程池数量改为从配置中读取，不再固定为 5
+
+**测试流程**：
+1. 在项目根目录创建 `config.json`，编写测试配置：
+   ```json
+   {
+       "port": 9090,
+       "root_dir": "./www",
+       "thread_count": 4,
+       "keep_alive_timeout": 10
+   }
+   ```
+2. 编译并启动服务器（使用配置文件）：
+   ```bash
+   cd build && cmake .. && make
+   ./bin/http_server --config ../config.json
+   ```
+3. 验证服务器使用的端口是 9090 而非默认的 8888：
+   ```bash
+   curl http://localhost:9090/index.html
+   ```
+4. 测试命令行参数仍能正常工作（向后兼容）：
+   ```bash
+   ./bin/http_server 8888 ../www/
+   curl http://localhost:8888/index.html
+   ```
+5. 修改 `config.json` 中的端口为 8081，重启服务器后验证端口变更生效：
+   ```bash
+   ./bin/http_server --config ../config.json
+   curl http://localhost:8081/index.html
+   ```
+
+**预期验收效果**：
+- 服务器能从 `config.json` 读取配置并按配置启动（端口、资源目录等）√
+- 使用配置文件启动时，不再需要传递命令行参数√
+- 原有的命令行参数方式仍然兼容，不影响旧的使用方式√
+- 修改配置文件后重启服务器，新配置立即生效√
+
+---
+
+### 6. 优化内容：SIGINT/SIGTERM 信号处理（优雅关闭）
+
+**为何优化**：README 已声明支持"信号处理实现优雅关闭"，但当前代码中完全没有注册信号处理器。
+用户按 `Ctrl+C` 或进程收到 `kill` 信号时，`HttpServer::stop()` 不会被调用，
+线程池中的任务无法正常完成，日志文件缓冲区也不会 flush，属于功能性缺陷。
+
+**涉及文件**：`main.cpp`、`HttpServer.h`、`HttpServer.cpp`
+
+**修改内容**：
+- 在 `main.cpp` 中引入 `<csignal>` 头文件，定义全局原子变量 `std::atomic<bool> g_running{true}` 
+以及信号处理函数 `void signalHandler(int sig)`，在其中将 `g_running` 置为 `false` 并打印关闭提示
+- 在 `main()` 开头注册 `SIGINT` 和 `SIGTERM` 两个信号：`signal(SIGINT, signalHandler); signal(SIGTERM, signalHandler);`
+- 因为当前 `HttpServer::start()` 内部是一个阻塞的事件循环，需要将 `start()` 改为**非阻塞启动**：
+把 `epoll_wait` 事件循环放到独立的线程中执行，`start()` 初始化完成后立即返回，让 `main()` 有机会轮询 `g_running`
+- 新增 `HttpServer::join()` 方法，等待事件循环线程结束；`main()` 在 `start()` 之后用 `while (g_running.load()) { sleep(1); }` 轮询，
+收到信号后退出循环并调用 `server.stop()` 再 `server.join()`
+- `HttpServer::stop()` 中确保先设置 `running_ = false`，让 `epoll_wait` 自然超时退出（因为超时设为 1 秒，信号响应延迟不超过 1 秒）
+
+**测试流程**：
+1. 编译并在后台启动服务器：`cd build && cmake .. && make && ./bin/http_server 8888 ../www/ &`
+2. 记录服务器进程 PID：`PID=$!`
+3. 先验证正常请求可用：`curl http://localhost:8888/index.html`
+4. 向服务器发送 SIGTERM 信号模拟优雅关闭：`kill -TERM $PID`
+5. 观察终端输出，应出现 "Received signal SIGTERM, shutting down..." 和 "HTTP Server stopped"
+6. 检查 `server.log` 文件末尾，确认日志完整记录了关闭信息（没有截断）
+7. 再启动一次服务器，使用 `Ctrl+C`（SIGINT）终止，验证同样输出优雅关闭日志
+8. 验证关闭后端口 8888 已释放：`netstat -tlnp | grep 8888`（应无输出）
+
+**预期验收效果**：
+- `kill -TERM <pid>` 发送 SIGTERM 信号时，服务器打印关闭提示并调用 stop() 正常退出 √
+- 前台运行时按 `Ctrl+C`（SIGINT），行为与 SIGTERM 一致，不会直接被操作系统强制终止 √
+- 优雅关闭后，线程池中正在执行的任务能够完成（没有资源泄漏）√
+- 关闭后 `server.log` 文件完整 flush，日志末尾没有截断 √
+- 端口被正确释放，重启服务器不会出现 "Address already in use" 错误 √
+
+---
+
+### 7. 优化内容：send() 循环发送处理部分发送（Partial Send）
+
+**为何优化**：当前 `sendResponse()` 只调用一次 `send()`，对于大文件（如 PDF、高清图片、较大的 HTML）或网络拥塞场景，
+`send()` 很可能只发送了部分字节就返回，导致客户端收到残缺的 HTTP 响应（页面乱码或图片损坏）。属于高优先级正确性修复。
+
+**涉及文件**：`HttpServer.cpp`（`sendResponse()` 方法）
+
+**修改内容**：
+- 重写 `sendResponse()`，用循环累计已发送字节数 `size_t total_sent = 0`
+- 每次 `send(resp_str.c_str() + total_sent, resp_str.size() - total_sent, 0)` 从未发送完的偏移量处继续发送
+- 如果 `send()` 返回 `< 0`：
+  - `errno == EAGAIN || errno == EWOULDBLOCK`：这是非阻塞 socket 的正常"暂时写不进去"情况，继续重试（可配合短 `usleep` 或稍后注册 EPOLLOUT）
+  - 其他错误（如 `ECONNRESET`）：跳出循环，记录错误日志
+- 如果 `send()` 返回 `0`：对端已关闭连接，跳出循环
+- 循环条件：`total_sent < resp_str.size()`
+
+**测试流程**：
+1. 准备一个 1MB 以上的测试文件（例如大图片或 PDF）放入 `www/`：
+   ```bash
+   dd if=/dev/urandom of=www/large.bin bs=1M count=2
+   ```
+2. 编译并启动服务器：`cd build && cmake .. && make && ./bin/http_server 8888 ../www/`
+3. 使用 `curl` 下载大文件并校验完整性：
+   ```bash
+   curl -o /tmp/large_download.bin http://localhost:8888/large.bin
+   ```
+4. 比对源文件和下载文件的 md5：
+   ```bash
+   md5sum ../www/large.bin /tmp/large_download.bin
+   ```
+5. 连续下载 10 次验证稳定性：
+   ```bash
+   for i in $(seq 1 10); do curl -s http://localhost:8888/large.bin -o /tmp/test_$i.bin; done
+   ```
+6. 验证小文件请求不受影响：`curl http://localhost:8888/index.html`
+
+**预期验收效果**：
+- 2MB 大文件每次下载都完整，md5 校验与源文件一致 √
+- 小文件（HTML、CSS）响应行为不变，响应体没有缺失 √
+- 多次连续下载没有出现 socket 卡住或崩溃 √
+- 对端中途断开连接时（如 `curl` 中途 Ctrl+C），服务器不会因 ECONNRESET 崩溃 √
+
+---
+
+### 8. 优化内容：connections_ 使用 unordered_map 替代 vector
+
+**为何优化**：当前 `std::vector<Connection> connections_` 每次查找连接、更新 last_active、关闭连接都需要 O(n) 遍历。
+当并发连接数达到数百甚至数千时，每次请求处理都会扫一遍 vector，加上 mutex 全局锁的加持，主线程和工作线程都会被阻塞，性能会出现明显下降。
+
+**涉及文件**：`HttpServer.h`、`HttpServer.cpp`
+
+**修改内容**：
+- `HttpServer.h` 中将 `std::vector<Connection> connections_;` 改为 `std::unordered_map<int, Connection> connections_;`
+- `handleNewConnection()` 中 `connections_.push_back(conn)` 改为 `connections_[client_fd] = conn;`（O(1) 插入）
+- `handleClientRequest()` 中查找连接更新 `last_active` 的 for 循环改为 `auto it = connections_.find(client_fd);`（O(1) 查找）
+- `processRequest()` 中两处获取 `keep_alive` 的 for 循环同样改为 `.find()` 直接访问
+- `closeConnection()` 中从 vector 中 erase 的循环改为 `connections_.erase(client_fd);`（O(1) 删除）
+- `checkTimeouts()` 遍历方式保持不变（unordered_map 同样支持迭代器遍历），注意迭代器失效的处理：`erase(it)` 返回的是下一个有效迭代器，赋值给 `it` 避免 `it++` 访问已失效元素
+
+**测试流程**：
+1. 编译并启动服务器：`cd build && cmake .. && make && ./bin/http_server 8888 ../www/`
+2. 基础功能回归测试：
+   ```bash
+   curl http://localhost:8888/index.html
+   curl http://localhost:8888/nonexistent.html
+   ```
+3. 高并发压测（ab）并观察 QPS 变化：
+   ```bash
+   ab -n 10000 -c 200 http://localhost:8888/index.html
+   ```
+4. 开启长连接压测，验证频繁查找 connections_ 不崩溃：
+   ```bash
+   ab -n 10000 -c 200 -k http://localhost:8888/index.html
+   ```
+5. 检查超时断开机制仍然生效：nc 建立连接不发数据，等待超时后应被正常关闭（连接数不再增长）
+
+**预期验收效果**：
+- 单请求功能不受影响，200/404 响应正常 √
+- 高并发（200 并发 10000 次请求）下服务器不崩溃、无泄漏 √
+- ab 压测 QPS 相比改造前有所提升或持平（不会因 O(n) 查找导致 QPS 骤降）√
+- 长连接（keep-alive）与超时断开机制正常工作 √
+- mutex 全局锁持有时间缩短（不再在锁内做 O(n) 遍历）√
+
+---
+
+### 9. 优化内容：HTTP 方法校验（返回 405 Method Not Allowed）
+
+**为何优化**：项目定位是"静态文件服务器"，只应响应 GET 请求。但当前代码无论收到 POST/PUT/DELETE/HEAD 什么方法，都会尝试去读本地文件，
+既不符合 HTTP 协议规范，也会让面试官觉得对协议理解不够细致。更严重的是：如果未来有人在项目基础上扩展其他业务，可能因为请求方法未校验而引入安全漏洞。
+
+**涉及文件**：`HttpServer.cpp`（`processRequest()` 方法）、`HttpResponse.h`、`HttpResponse.cpp`
+
+**修改内容**：
+- `processRequest()` 解析完 HTTP 请求后，首先检查 `http_request.method()` 是否为 `"GET"`（不区分大小写比较）
+- 如果不是 GET，调用新的 `HttpResponse::methodNotAllowed()` 生成 405 响应，并在响应头中添加 `Allow: GET` 告知客户端允许的方法
+- `HttpResponse` 中新增 `static HttpResponse methodNotAllowed();` 静态方法，返回 405 状态码及 HTML 错误页面（格式与现有的 `notFound()` / `internalError()` 一致）
+- 错误处理流程保持一致：先发送 405 响应，再根据 keep_alive 决定是否关闭连接
+
+**测试流程**：
+1. 编译并启动服务器：`cd build && cmake .. && make && ./bin/http_server 8888 ../www/`
+2. 使用 curl 发送 POST 请求，验证返回 405：
+   ```bash
+   curl -i -X POST -d "data=test" http://localhost:8888/index.html
+   ```
+3. 使用 curl 发送 PUT 请求，验证返回 405 且响应头包含 `Allow: GET`：
+   ```bash
+   curl -v -X PUT http://localhost:8888/index.html 2>&1 | grep -E "405|Allow:"
+   ```
+4. 使用 curl 发送 DELETE 请求，同样返回 405：
+   ```bash
+   curl -i -X DELETE http://localhost:8888/index.html
+   ```
+5. 验证 GET 请求不受影响（核心业务回归）：
+   ```bash
+   curl -i http://localhost:8888/index.html   # 应返回 200
+   curl -i http://localhost:8888/notexist.html # 应返回 404
+   ```
+6. 验证 HEAD 请求（虽然也是只读，但目前服务器未实现 HEAD 专用逻辑，可按 405 处理，或在后续扩展中专门实现）
+
+**预期验收效果**：
+- POST / PUT / DELETE 等非 GET 请求都返回 405 Method Not Allowed √
+- 405 响应头中包含 `Allow: GET`（HTTP 协议强制要求）√
+- 405 响应体中有 HTML 错误页面（与 404 风格一致）√
+- 普通 GET 请求仍正常返回 200 或 404，不受该优化影响 √
+- 日志中正确记录 405 状态码 √
+
+---
+
+### 10. 优化内容：FileUtil 使用 vector 替代裸 new/delete
+
+**为何优化**：当前 `FileUtil::readFile()` 使用 `char* buffer = new char[file_size + 1];` 分配内存，
+然后在多个提前 return 路径中手动 `delete[] buffer;`。一是代码冗余易漏（如果未来新增 return 分支忘记写 delete 就会直接内存泄漏）；
+二是如果 `new` 因文件过大抛出 `std::bad_alloc` 异常，`delete` 永远不会执行。使用 RAII 容器（vector）可以彻底消除这些隐患，同时代码更简洁。
+
+**涉及文件**：`FileUtil.cpp`（`readFile()` 方法）
+
+**修改内容**：
+- 去掉 `char* buffer = new char[file_size + 1];` 及对应的所有 `delete[] buffer;`
+- 改为 `std::vector<char> buffer(file_size + 1);`，用 `buffer.data()` 代替原来的 `buffer` 指针
+- `fread(buffer.data(), 1, file_size, fp);` 直接写入 vector 的底层数组
+- `buffer[bytes_read] = '\0';` 行为不变（vector 元素按顺序连续存储）
+- `content_ = buffer.data();` 将 C 字符串赋值给 `std::string` 保持不变
+- 所有提前 return 的分支不再需要手动释放内存，vector 离开作用域自动析构
+
+**测试流程**：
+1. 编译并启动服务器：`cd build && cmake .. && make && ./bin/http_server 8888 ../www/`
+2. 回归文件读取测试：
+   ```bash
+   curl -i http://localhost:8888/index.html
+   curl -i http://localhost:8888/about.html
+   ```
+3. 准备不存在的文件验证 404 路径不会崩溃：
+   ```bash
+   curl -i http://localhost:8888/notexist.txt
+   ```
+4. 准备 0 字节空文件验证边界：
+   ```bash
+   touch ../www/empty.txt
+   curl -i http://localhost:8888/empty.txt
+   ```
+5. 使用 valgrind（Linux 下）检查没有内存泄漏：
+   ```bash
+   valgrind --leak-check=full ./bin/http_server 8888 ../www/ &
+   curl http://localhost:8888/index.html
+   curl http://localhost:8888/notexist.html
+   kill %1
+   # valgrind 报告中 "definitely lost" 字节数应为 0
+   ```
+
+**预期验收效果**：
+- 正常文件读取内容不变，HTTP 响应体与改造前完全一致 √
+- 文件不存在 / fopen 失败 / fread 不完整等所有提前 return 路径都不再有内存泄漏风险 √
+- 0 字节空文件能够正常返回（不会因 `new char[1]` 与 vector 的差异而出问题）√
+- valgrind 检测下没有 "definitely lost" 和 "indirectly lost" 的泄漏 √
+- 代码行数略有减少，不再需要多处重复的 `delete[]` 清理 √
+
+---
+
+### 11. 优化内容：响应头添加缓存控制（Cache-Control / Last-Modified）
+
+**为何优化**：目前 HttpResponse 的响应头中只有 Content-Type、Content-Length、Connection，完全没有任何缓存相关字段。
+浏览器和 CDN 无法判断文件是否需要重新下载，导致每次访问同一个页面都会重新传输完整内容。对于图片、CSS、JS 等静态资源来说，浪费带宽且响应慢。
+对于简历项目来说，增加缓存头能体现对 HTTP 协议细节的理解深度。
+
+**涉及文件**：`HttpResponse.h`、`HttpResponse.cpp`、`HttpServer.cpp`（`processRequest()` 中读取文件元数据）
+
+**修改内容**：
+- `HttpResponse` 类中新增 `setLastModified(time_t mtime)` 和 `setCacheControl(const std::string& value)` 
+两个公有方法，以及对应的私有成员变量 `std::string last_modified_` 和 `std::string cache_control_`
+- `toString()` 生成响应头时，如果 `last_modified_` 非空，追加 `Last-Modified: <RFC1123格式时间>\r\n`；
+如果 `cache_control_` 非空，追加 `Cache-Control: <value>\r\n`
+- RFC1123 时间格式示例：`Sun, 06 Jul 2026 08:49:37 GMT`，使用 `strftime()` + `gmtime()` 实现
+- `processRequest()` 中成功读取文件后，通过 `stat(full_path.c_str(), &st)` 获取文件的 `st_mtime`（修改时间），
+调用 `response.setLastModified(st.st_mtime)`
+- Cache-Control 策略：HTML 页面设置 `Cache-Control: no-cache`（每次都验证但可缓存），
+图片 / CSS / JS 等静态资源设置 `Cache-Control: public, max-age=3600`（缓存 1 小时）
+
+**测试流程**：
+1. 编译并启动服务器：`cd build && cmake .. && make && ./bin/http_server 8888 ../www/`
+2. 请求 index.html，验证响应头中存在 Last-Modified 和 Cache-Control：
+   ```bash
+   curl -i http://localhost:8888/index.html | grep -E "Last-Modified|Cache-Control"
+   ```
+3. 准备一张 PNG 图片放入 www 并请求，验证 Cache-Control 是 `public, max-age=3600`：
+   ```bash
+   curl -i http://localhost:8888/test.png | grep "Cache-Control"
+   ```
+4. 404 响应不带文件信息，验证不会崩溃（即使没有 Last-Modified 也能正常响应）：
+   ```bash
+   curl -i http://localhost:8888/notexist.html | head -20
+   ```
+5. 使用浏览器两次请求同一资源，第二次应看到浏览器命中本地缓存（DevTools → Network 面板显示 200 from disk cache 或 304 Not Modified，具体取决于浏览器策略）
+
+**预期验收效果**：
+- HTML 响应头中包含 `Last-Modified: <RFC1123 时间>` 和 `Cache-Control: no-cache` √
+- 图片 / CSS / JS 响应头中包含 `Last-Modified` 和 `Cache-Control: public, max-age=3600` √
+- 404 / 500 等错误响应不会因为设置缓存头而崩溃或异常 √
+- Last-Modified 时间值与源文件的实际修改时间（`stat www/index.html`）一致 √
+- 连续两次浏览器访问同一图片，第二次传输字节数明显少于第一次（命中缓存）√
+
+---
+
+### 12. 优化内容：root_dir 路径归一化与相对路径修复
+
+**为何优化**：`config.json` 中默认 `"root_dir": "./www"` 使用的是相对于"运行时工作目录"的相对路径。
+如果用户从 `build/` 目录启动服务器（`./bin/http_server --config ../config.json`），`./www` 会被解析成 `build/www/`，但实际 www 目录在项目根目录，导致所有文件 404。
+这是典型的"配置文件相对路径基准混乱"问题，在真实项目中经常踩到的坑，提前修好能体现工程经验。
+
+**涉及文件**：`main.cpp`
+
+**修改内容**：
+- 在 `readConfigFromFile()` 成功读取 `root_dir` 后，进行**相对路径归一化**：
+  - 如果 `root_dir` 以 `/` 开头（绝对路径），保持不变
+  - 如果是相对路径（不以 `/` 开头），将其拼接到"配置文件所在的目录"而非"当前工作目录"
+  - 配置文件目录可以从 `argv[2]`（传给 `--config` 的路径）中提取：例如 `../config.json` → 目录为 `../`，再拼 `./www` → `.././www` → 规范化成 `../www/`
+- 额外添加规范化：确保结尾只有一个 `/`，避免 `root_dir` 是 `../www` 又被后面追加一个 `/` 变成 `../www//` 虽然能工作但不美观
+- 打印启动信息时（Port / Root Dir / Threads 那段），输出规范化之后的绝对路径或解析后的路径，方便用户一眼确认是否找对了目录
+
+**测试流程**：
+1. 保持 `config.json` 中 `root_dir: "./www"`（项目根目录）
+2. 进入 build 目录使用相对路径启动（最常见的使用方式）：
+   ```bash
+   cd build
+   ./bin/http_server --config ../config.json
+   ```
+3. 观察启动信息中的 Root Dir 显示，应该被解析为 `../www/` 或等价的项目根 www 绝对路径
+4. 请求 index.html 验证能拿到文件（不会 404）：
+   ```bash
+   curl http://localhost:8888/index.html
+   ```
+5. 在 config.json 中将 root_dir 改为绝对路径测试：`"/home/xxx/HTTP_server/www"`，同样能正常访问
+6. 在 build 目录下使用传统命令行参数方式，验证相对路径仍然按当前工作目录（build）解析（保持向后兼容）：
+   ```bash
+   ./bin/http_server 8888 ../www/
+   curl http://localhost:8888/index.html
+   ```
+
+**预期验收效果**：
+- `--config ../config.json` 配合 `"root_dir": "./www"` 能正确找到项目根的 www/，不会误解析到 build/www/ √
+- 启动信息中 Root Dir 字段显示解析后的完整路径，用户能肉眼确认 √
+- 传入绝对路径时（`/home/xxx/www`）行为不变 √
+- 传统命令行参数 `./bin/http_server 8888 ../www/` 继续按当前工作目录解析，向后兼容 √
+- root_dir 末尾自动补齐 `/`，不会出现 `www//index.html` 这种双斜杠拼接（即使出现也应该兼容）√

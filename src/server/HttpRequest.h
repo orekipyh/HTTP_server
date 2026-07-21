@@ -58,6 +58,11 @@ private:
     // 返回: 解析成功返回true
     bool parseHeader(const std::string& header_line);
 
+    // 解析请求体
+    // body: 请求体内容
+    // 返回: 解析成功返回true
+    bool parseBody(const std::string& body);
+
     // 将字符串两端空白字符去除
     // str: 待处理的字符串
     void trim(std::string& str);
@@ -66,6 +71,7 @@ private:
     std::string path_;                      // 请求路径
     std::string version_;                   // HTTP版本
     std::map<std::string, std::string> headers_;  // 请求头映射表
+    std::string body_;
 };
 
 #endif // HTTP_REQUEST_H

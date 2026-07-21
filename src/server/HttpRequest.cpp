@@ -66,6 +66,34 @@ bool HttpRequest::parse(const std::string& request) {
         }
     }
 
+    // 解析请求体（根据 Content-Length 精确读取）
+    // 请求体是原始二进制数据，不能用 getline 逐行读（会破坏二进制内容和换行符）
+    std::string content_length_str = getHeader("Content-Length");
+    if (!content_length_str.empty()) {
+        try {
+            size_t body_size = std::stoul(content_length_str);
+            if (body_size > 0) {
+                // 从 stream 当前位置读取指定字节数的请求体
+                // 此时 stream 指针已越过 \r\n\r\n，指向请求体的起始位置
+                // 创建一个长度为body_size的字符串每个字符初始化为\0用于存储请求体内容
+                std::string body_content(body_size, '\0');
+                // 从 stream 当前位置读取 body_size 字个字节到 body_content
+                stream.read(&body_content[0], body_size);
+
+                // 检查是否读到了足够的字节
+                if (static_cast<size_t>(stream.gcount()) != body_size) {
+                    return false;
+                }
+
+                if (!parseBody(body_content)) {
+                    return false;
+                }
+            }
+        } catch (...) {
+            return false;
+        }
+    }
+
     return true;
 }
 
@@ -128,6 +156,16 @@ bool HttpRequest::parseHeader(const std::string& header_line) {
     // 存储到headers_映射表中
     headers_[name] = value;
 
+    return true;
+}
+
+// 解析请求体
+// body: 原始请求体的完整内容（基于 Content-Length 精确读取）
+bool HttpRequest::parseBody(const std::string& body) {
+    if (body.empty()) {
+        return false;
+    }
+    body_ = body;
     return true;
 }
 
